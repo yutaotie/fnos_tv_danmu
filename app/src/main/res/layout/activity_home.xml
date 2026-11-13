@@ -242,10 +242,41 @@ DPAD 遥控器友好
                             android:layout_marginBottom="8dp"
                             android:background="@color/divider" />
 
+                        <!-- 我的下载 -->
+                        <RelativeLayout
+                            android:id="@+id/rlOfflineDownloads"
+                            android:layout_width="match_parent"
+                            android:layout_height="52dp"
+                            android:background="@drawable/bg_input"
+                            android:focusable="true"
+                            android:paddingLeft="12dp"
+                            android:paddingRight="12dp">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_centerVertical="true"
+                                android:text="我的下载"
+                                android:textColor="@color/text_primary"
+                                android:textSize="14sp" />
+
+                            <TextView
+                                android:id="@+id/tvOfflineCount"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_alignParentRight="true"
+                                android:layout_centerVertical="true"
+                                android:text=""
+                                android:textColor="@color/colorAccent"
+                                android:textSize="14sp" />
+
+                        </RelativeLayout>
+
                         <RelativeLayout
                             android:id="@+id/rlDecoderSetting"
                             android:layout_width="match_parent"
                             android:layout_height="52dp"
+                            android:layout_marginTop="8dp"
                             android:background="@drawable/bg_input"
                             android:focusable="true"
                             android:paddingLeft="12dp"

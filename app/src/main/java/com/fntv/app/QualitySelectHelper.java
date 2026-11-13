@@ -38,14 +38,21 @@ public class QualitySelectHelper {
         public final boolean progressive;
         public final boolean isM3u8;
         public final boolean isOriginal;
+        /** 云盘/strm 直链 URL（非空表示该档位走云直链缓存，而非 NAS 转码） */
+        public final String directUrl;
 
         public QualityOption(String label, String resolution, int bitrate, boolean progressive, boolean isM3u8, boolean isOriginal) {
+            this(label, resolution, bitrate, progressive, isM3u8, isOriginal, null);
+        }
+
+        public QualityOption(String label, String resolution, int bitrate, boolean progressive, boolean isM3u8, boolean isOriginal, String directUrl) {
             this.label = label;
             this.resolution = resolution;
             this.bitrate = bitrate;
             this.progressive = progressive;
             this.isM3u8 = isM3u8;
             this.isOriginal = isOriginal;
+            this.directUrl = directUrl;
         }
     }
 
@@ -123,8 +130,8 @@ public class QualitySelectHelper {
         });
     }
 
-    /** 构建画质选项 */
-    private List<QualityOption> buildOptions(List<StreamResponse.Quality> qualities) {
+    /** 构建画质选项（下载缓存弹窗 4.3 复用同一分组规则） */
+    public static List<QualityOption> buildOptions(List<StreamResponse.Quality> qualities) {
         Map<String, List<StreamResponse.Quality>> groups = new HashMap<>();
         for (StreamResponse.Quality q : qualities) {
             if (q.resolution == null || q.resolution.isEmpty()) continue;
@@ -146,6 +153,37 @@ public class QualitySelectHelper {
             Collections.sort(list, (a, b) -> b.bitrate - a.bitrate);
             StreamResponse.Quality pick = isHighest ? list.get(1) : list.get(0);
             result.add(new QualityOption(formatResLabel(res), res, pick.bitrate, pick.progressive, pick.isM3u8, false));
+        }
+        return result;
+    }
+
+    /**
+     * 云盘/strm 内容的缓存档位：直接采用 stream 返回的 directLinkQualities 直链。
+     * 按分辨率/码率降序，最高档标记"原画"（仅展示用，isOriginal=false，
+     * 缓存走云直链而非 NAS media/range）。
+     */
+    public static List<QualityOption> buildCloudOptions(StreamResponse stream) {
+        List<QualityOption> result = new ArrayList<>();
+        if (stream == null || stream.directLinkQualities == null) return result;
+        List<StreamResponse.DirectLinkQuality> list = new ArrayList<>();
+        for (StreamResponse.DirectLinkQuality q : stream.directLinkQualities) {
+            if (q != null && q.url != null && !q.url.isEmpty()) list.add(q);
+        }
+        Collections.sort(list, (a, b) -> {
+            int r = resToNum(b.resolution) - resToNum(a.resolution);
+            return r != 0 ? r : b.bitrate - a.bitrate;
+        });
+        java.util.HashSet<String> usedLabels = new java.util.HashSet<>();
+        for (int i = 0; i < list.size(); i++) {
+            StreamResponse.DirectLinkQuality q = list.get(i);
+            String res = q.resolution != null ? q.resolution : "";
+            String label = i == 0 ? "原画" : (res.isEmpty() ? "直链" + (i + 1) : formatResLabel(res));
+            if (!usedLabels.add(label)) {
+                label = label + "·" + (q.bitrate > 0 ? q.bitrate / 1000 + "k" : String.valueOf(i + 1));
+                usedLabels.add(label);
+            }
+            String url = q.url.replace("\\u0026", "&");
+            result.add(new QualityOption(label, res, q.bitrate, q.progressive, q.isM3u8, false, url));
         }
         return result;
     }

@@ -924,131 +924,204 @@ public class DanmuManager {
                 String l;
                 while ((l = r.readLine()) != null) sb.append(l);
                 r.close();
-                String raw = sb.toString();
-                JSONArray arr;
-                if (raw.trim().startsWith("{")) {
-                    JSONObject jo = new JSONObject(raw);
-                    if (jo.has("comments")) arr = jo.getJSONArray("comments");
-                    else if (jo.has("data")) arr = jo.getJSONArray("data");
-                    else arr = new JSONArray();
-                } else {
-                    arr = new JSONArray(raw);
-                }
-                int maxCom = prefs.getInt("danmu_maxcomments", 50000);
-                int total = arr.length();
-                float keepRate = total > maxCom ? (float) maxCom / total : 1f;
-                final List<DanmuView.DanmuComment> list = new java.util.ArrayList<>(Math.min(total, maxCom));
-                for (int i = 0; i < total; i++) {
-                    // 超过上限时按比例稀疏，保留均匀分布
-                    if (keepRate < 1f && Math.random() >= keepRate) continue;
-
-                    JSONObject o = arr.getJSONObject(i);
-                    DanmuView.DanmuComment dc = new DanmuView.DanmuComment();
-                    dc.text = o.optString("m", "");
-
-                    String pVal = o.optString("p", "0");
-                    if (pVal.contains(",")) {
-                        String[] parts = pVal.split(",");
-                        try {
-                            dc.time = Float.parseFloat(parts[0].trim());
-                        } catch (Exception e2) {
-                            dc.time = 0;
-                        }
-                        // 解析弹幕模式：1=滚动 4=底部 5=顶部
-                        if (parts.length >= 2) {
-                            try {
-                                dc.type = Integer.parseInt(parts[1].trim());
-                            } catch (Exception e2) {
-                                dc.type = 1;
-                            }
-                        }
-                        if (parts.length >= 4) {
-                            try {
-                                dc.color = 0xFF000000 | (int) Long.parseLong(parts[2].trim());
-                            } catch (Exception e2) {
-                                dc.color = 0xFFFFFFFF;
-                            }
-                        } else {
-                            dc.color = 0xFFFFFFFF;
-                        }
-                    } else {
-                        try {
-                            dc.time = Float.parseFloat(pVal);
-                        } catch (Exception e2) {
-                            dc.time = 0;
-                        }
-                        dc.type = 1;
-                        dc.color = 0xFF000000 | o.optInt("c", 0xFFFFFF);
-                    }
-
-                    // 打印前 10 条弹幕的颜色和模式，方便调试
-                    if (i < 10) Log.d(TAG, "[弹幕#" + i + "] \"" + dc.text
-                            + "\" color=0x" + String.format("%08X", dc.color)
-                            + " mode=" + dc.type + " raw=" + pVal);
-
-                    list.add(dc);
-                }
-
-                java.util.Collections.sort(list, (a, b) -> Float.compare(a.time, b.time));
-
-                final int loaded = list.size();
-                activity.runOnUiThread(() -> {
-                    danmuItemsOriginal = new java.util.ArrayList<>(list);
-                    danmuItems = list;
-                    // 弹幕时间戳压缩匹配视频时长（可选）
-                    boolean timeScale = prefs.getBoolean("danmu_time_scale", false);
-                    if (timeScale) {
-                        long videoDur = 0;
-                        Player p = data.getPlayer();
-                        if (p != null && p.getDuration() > 0)
-                            videoDur = p.getDuration() / 1000;
-                        else if (data.getItemDuration() > 0)
-                            videoDur = data.getItemDuration();
-                        if (videoDur > 0 && !list.isEmpty()) {
-                            float maxDanmuTime = list.get(list.size() - 1).time;
-                            if (maxDanmuTime > 0) {
-                                float ratio = (float) videoDur / maxDanmuTime;
-                                for (DanmuView.DanmuComment dc2 : list) {
-                                    dc2.time *= ratio;
-                                }
-                                Log.d(TAG, "[弹幕] 时间匹配 " + maxDanmuTime + "s → " + videoDur + "s ratio=" + String.format("%.3f", ratio));
-
-                                // 差距超过 ±5% 时警告
-                                if (ratio < 0.95f || ratio > 1.05f) {
-                                    float diffPct = Math.abs((1f - ratio) * 100f);
-                                    String direction = ratio < 1f ? "弹幕偏长" : "弹幕偏短";
-                                    showDanmuStatus(direction
-                                            + " 弹幕=" + (int) maxDanmuTime + "s"
-                                            + " 视频=" + (int) videoDur + "s"
-                                            + " 差距=" + String.format("%.1f", diffPct) + "%");
-                                }
-                            }
-                        }
-                    }
-
-                    // 应用时间偏移
-                    int offsetSec = prefs.getInt("danmu_offset", 0);
-                    if (offsetSec != 0) {
-                        for (DanmuView.DanmuComment dc3 : list) {
-                            dc3.time += offsetSec;
-                        }
-                        Log.d(TAG, "[弹幕] 时间偏移 " + offsetSec + "s");
-                    }
-
-                    if (danmuView != null) {
-                        danmuView.loadDanmu(list);
-                        if (danmuOn) {
-                            danmuView.start();
-                        }
-                    }
-                    String msg = (epName != null ? epName + " " : "") + "弹幕加载完成·共" + total + "条";
-                    if (loaded < total) msg += "（显示前" + loaded + "条）";
-                    showDanmuStatus(msg);
-                });
+                applyDanmuList(parseComments(sb.toString()), epName);
             } catch (Exception e) {
                 showDanmuStatus("弹幕失败: " + e.getMessage());
             }
         }).start();
+    }
+
+    /** 弹幕解析结果（total 为原始条数，comments 为稀疏后列表） */
+    public static class ParsedDanmu {
+        public final List<DanmuView.DanmuComment> comments;
+        public final int total;
+        ParsedDanmu(List<DanmuView.DanmuComment> comments, int total) {
+            this.comments = comments;
+            this.total = total;
+        }
+    }
+
+    /** 解析弹幕接口返回的 comment JSON（在线与离线共用，3.1/6.2） */
+    private ParsedDanmu parseComments(String raw) throws Exception {
+        JSONArray arr;
+        if (raw.trim().startsWith("{")) {
+            JSONObject jo = new JSONObject(raw);
+            if (jo.has("comments")) arr = jo.getJSONArray("comments");
+            else if (jo.has("data")) arr = jo.getJSONArray("data");
+            else arr = new JSONArray();
+        } else {
+            arr = new JSONArray(raw);
+        }
+        int maxCom = prefs.getInt("danmu_maxcomments", 50000);
+        int total = arr.length();
+        float keepRate = total > maxCom ? (float) maxCom / total : 1f;
+        final List<DanmuView.DanmuComment> list = new java.util.ArrayList<>(Math.min(total, maxCom));
+        for (int i = 0; i < total; i++) {
+            // 超过上限时按比例稀疏，保留均匀分布
+            if (keepRate < 1f && Math.random() >= keepRate) continue;
+
+            JSONObject o = arr.getJSONObject(i);
+            DanmuView.DanmuComment dc = new DanmuView.DanmuComment();
+            dc.text = o.optString("m", "");
+
+            String pVal = o.optString("p", "0");
+            if (pVal.contains(",")) {
+                String[] parts = pVal.split(",");
+                try {
+                    dc.time = Float.parseFloat(parts[0].trim());
+                } catch (Exception e2) {
+                    dc.time = 0;
+                }
+                // 解析弹幕模式：1=滚动 4=底部 5=顶部
+                if (parts.length >= 2) {
+                    try {
+                        dc.type = Integer.parseInt(parts[1].trim());
+                    } catch (Exception e2) {
+                        dc.type = 1;
+                    }
+                }
+                if (parts.length >= 4) {
+                    try {
+                        dc.color = 0xFF000000 | (int) Long.parseLong(parts[2].trim());
+                    } catch (Exception e2) {
+                        dc.color = 0xFFFFFFFF;
+                    }
+                } else {
+                    dc.color = 0xFFFFFFFF;
+                }
+            } else {
+                try {
+                    dc.time = Float.parseFloat(pVal);
+                } catch (Exception e2) {
+                    dc.time = 0;
+                }
+                dc.type = 1;
+                dc.color = 0xFF000000 | o.optInt("c", 0xFFFFFF);
+            }
+
+            // 打印前 10 条弹幕的颜色和模式，方便调试
+            if (i < 10) Log.d(TAG, "[弹幕#" + i + "] \"" + dc.text
+                    + "\" color=0x" + String.format("%08X", dc.color)
+                    + " mode=" + dc.type + " raw=" + pVal);
+
+            list.add(dc);
+        }
+        java.util.Collections.sort(list, (a, b) -> Float.compare(a.time, b.time));
+        return new ParsedDanmu(list, total);
+    }
+
+    /** 将弹幕列表应用到弹幕视图：时长匹配/时间偏移/启动（在线与离线共用） */
+    private void applyDanmuList(ParsedDanmu pd, String epName) {
+        final List<DanmuView.DanmuComment> list = pd.comments;
+        final int total = pd.total;
+        final int loaded = list.size();
+        activity.runOnUiThread(() -> {
+            danmuItemsOriginal = new java.util.ArrayList<>(list);
+            danmuItems = list;
+            // 弹幕时间戳压缩匹配视频时长（可选）
+            boolean timeScale = prefs.getBoolean("danmu_time_scale", false);
+            if (timeScale) {
+                long videoDur = 0;
+                Player p = data.getPlayer();
+                if (p != null && p.getDuration() > 0)
+                    videoDur = p.getDuration() / 1000;
+                else if (data.getItemDuration() > 0)
+                    videoDur = data.getItemDuration();
+                if (videoDur > 0 && !list.isEmpty()) {
+                    float maxDanmuTime = list.get(list.size() - 1).time;
+                    if (maxDanmuTime > 0) {
+                        float ratio = (float) videoDur / maxDanmuTime;
+                        for (DanmuView.DanmuComment dc2 : list) {
+                            dc2.time *= ratio;
+                        }
+                        Log.d(TAG, "[弹幕] 时间匹配 " + maxDanmuTime + "s → " + videoDur + "s ratio=" + String.format("%.3f", ratio));
+
+                        // 差距超过 ±5% 时警告
+                        if (ratio < 0.95f || ratio > 1.05f) {
+                            float diffPct = Math.abs((1f - ratio) * 100f);
+                            String direction = ratio < 1f ? "弹幕偏长" : "弹幕偏短";
+                            showDanmuStatus(direction
+                                    + " 弹幕=" + (int) maxDanmuTime + "s"
+                                    + " 视频=" + (int) videoDur + "s"
+                                    + " 差距=" + String.format("%.1f", diffPct) + "%");
+                        }
+                    }
+                }
+            }
+
+            // 应用时间偏移
+            int offsetSec = prefs.getInt("danmu_offset", 0);
+            if (offsetSec != 0) {
+                for (DanmuView.DanmuComment dc3 : list) {
+                    dc3.time += offsetSec;
+                }
+                Log.d(TAG, "[弹幕] 时间偏移 " + offsetSec + "s");
+            }
+
+            if (danmuView != null) {
+                danmuView.loadDanmu(list);
+                if (danmuOn) {
+                    danmuView.start();
+                }
+            }
+            String msg = (epName != null ? epName + " " : "") + "弹幕加载完成·共" + total + "条";
+            if (loaded < total) msg += "（显示前" + loaded + "条）";
+            showDanmuStatus(msg);
+        });
+    }
+
+    // ========== 离线弹幕（6.2） ==========
+
+    /** 离线播放弹幕：读取下载时落盘的弹幕 JSON 渲染，全程无网络请求 */
+    public void loadDanmuOffline(String itemGuid) {
+        if (!danmuOn) {
+            showDanmuStatus("弹幕: 已关闭");
+            return;
+        }
+        showDanmuStatus("弹幕: 读取本地缓存…");
+        new Thread(() -> {
+            try {
+                String raw = readOfflineDanmu(itemGuid);
+                if (raw == null || raw.isEmpty()) {
+                    updateDanmuMatchDisplay("");
+                    showDanmuStatus("弹幕: 本地无缓存弹幕");
+                    return;
+                }
+                updateDanmuMatchDisplay("本地弹幕");
+                applyDanmuList(parseComments(raw), "本地弹幕");
+            } catch (Exception e) {
+                showDanmuStatus("弹幕失败: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    /** 读取离线弹幕文件：元数据库记录路径优先，回退默认目录 */
+    private String readOfflineDanmu(String itemGuid) {
+        try {
+            DownloadDbHelper.DownloadRecord rec =
+                    OfflineManager.getInstance(activity).getRecord(itemGuid);
+            if (rec != null && rec.danmuPath != null && !rec.danmuPath.isEmpty()) {
+                java.io.File f = new java.io.File(rec.danmuPath);
+                if (f.exists()) return readFileText(f);
+            }
+            java.io.File f2 = new java.io.File(
+                    new java.io.File(activity.getFilesDir(), "danmu"),
+                    itemGuid + ".danmu.json");
+            if (f2.exists()) return readFileText(f2);
+        } catch (Exception e) {
+            Log.w(TAG, "读本地弹幕失败: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static String readFileText(java.io.File f) throws Exception {
+        java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+        StringBuilder sb = new StringBuilder();
+        String l;
+        while ((l = r.readLine()) != null) sb.append(l);
+        r.close();
+        return sb.toString();
     }
 
     // ========== 自动匹配 ==========

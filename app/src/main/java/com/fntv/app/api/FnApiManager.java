@@ -15,6 +15,7 @@ public class FnApiManager {
     private final AuthInterceptor authInterceptor;
     private OkHttpClient okHttpClient; // 供 API 和图片使用
     private OkHttpClient streamClient; // 专供视频流使用（独立连接池）
+    private OkHttpClient downloadClient; // 离线下载专用（有限超时，避免卡死在速度0）
     private static final HostnameVerifier TRUST_ALL_HOSTS = (hostname, session) -> true;
 
     private FnApiManager() {
@@ -26,7 +27,7 @@ public class FnApiManager {
         return instance;
     }
 
-    private OkHttpClient buildClient(boolean streaming) {
+    private OkHttpClient buildClient(boolean streaming, boolean finiteTimeouts) {
         try {
             X509TrustManager trustAll = new X509TrustManager() {
                 @Override public void checkClientTrusted(X509Certificate[] chain, String authType) {}
@@ -41,10 +42,12 @@ public class FnApiManager {
                     .sslSocketFactory(sslContext.getSocketFactory(), trustAll)
                     .hostnameVerifier(TRUST_ALL_HOSTS);
             if (streaming) {
-                // 视频流：不设超时，独立连接池
-                builder.connectTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        .readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        .writeTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
+                // 视频流：播放不设超时；下载用有限超时，卡住时能失败重试而非永远停在速度0
+                long t = finiteTimeouts ? 30000 : 0;
+                long rt = finiteTimeouts ? 60000 : 0;
+                builder.connectTimeout(t, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .readTimeout(rt, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .writeTimeout(t, java.util.concurrent.TimeUnit.MILLISECONDS)
                         .retryOnConnectionFailure(true)
                         .connectionPool(new okhttp3.ConnectionPool(4, 30, java.util.concurrent.TimeUnit.SECONDS));
             } else {
@@ -59,8 +62,10 @@ public class FnApiManager {
             OkHttpClient.Builder builder = new OkHttpClient.Builder().addInterceptor(authInterceptor)
                     .hostnameVerifier(TRUST_ALL_HOSTS);
             if (streaming) {
-                builder.connectTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS)
-                        .readTimeout(0, java.util.concurrent.TimeUnit.MILLISECONDS);
+                long t = finiteTimeouts ? 30000 : 0;
+                long rt = finiteTimeouts ? 60000 : 0;
+                builder.connectTimeout(t, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .readTimeout(rt, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
             try {
                 X509TrustManager fallbackTrust = new X509TrustManager() {
@@ -86,8 +91,17 @@ public class FnApiManager {
             effectiveBaseUrl = effectiveBaseUrl.substring(0, vIndex);
         }
 
-        okHttpClient = buildClient(false);
-        streamClient = buildClient(true);
+        okHttpClient = buildClient(false, false);
+        streamClient = buildClient(true, false);
+        downloadClient = buildClient(true, true);
+
+        // 记录 NAS host，供 AuthInterceptor 区分 NAS 请求与云盘直链请求
+        try {
+            String host = android.net.Uri.parse(effectiveBaseUrl).getHost();
+            if (host != null && !host.isEmpty()) {
+                authInterceptor.setNasHost(host);
+            }
+        } catch (Exception ignored) {}
 
         retrofit2.Retrofit retrofit = new Retrofit.Builder()
                 .baseUrl(effectiveBaseUrl + "/v/")
@@ -107,4 +121,7 @@ public class FnApiManager {
 
     /** 获取视频流专用 OkHttpClient（无超时，独立连接池） */
     public OkHttpClient getStreamClient() { return streamClient; }
+
+    /** 获取离线下载专用 OkHttpClient（有限超时，独立连接池） */
+    public OkHttpClient getDownloadClient() { return downloadClient; }
 }

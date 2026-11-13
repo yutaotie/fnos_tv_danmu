@@ -65,6 +65,7 @@ public class PlayerActivity extends AppCompatActivity {
     private FnApiManager apiManager;
     private String mediaGuid, videoGuid, audioGuid, subtitleGuid, resolution;
     private boolean seeked = false, ctrlVis = false, infoVis = false;
+    private boolean isOffline = false; // 离线播放模式（6.1：读 SimpleCache，无网络）
     private long seekTs = 0;
     private float[] speeds = {1.0f, 1.25f, 1.5f, 2.0f, 0.5f, 0.75f};
     private int speedIdx = 0, ratioIdx = 0;
@@ -125,6 +126,7 @@ public class PlayerActivity extends AppCompatActivity {
         itemPoster = getIntent().getStringExtra("poster");
         itemCategory = getIntent().getStringExtra("category");
         parentGuid = getIntent().getStringExtra("parent_guid");
+        isOffline = getIntent().getBooleanExtra("offline", false);
 
         playerView = findViewById(R.id.playerView);
         tvBuffering = findViewById(R.id.tvBuffering);
@@ -482,8 +484,12 @@ public class PlayerActivity extends AppCompatActivity {
         });
 
         showCtrl(true);
-        loadPlayInfo();
-        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        if (isOffline) {
+            startOfflinePlayback();
+        } else {
+            loadPlayInfo();
+        }
+        // 跟随系统屏幕旋转锁定策略（Manifest 已设 fullUser），不再强制横屏
         hideSystemUi();
 
         // 控制栏隐藏时的进度时间浮层
@@ -602,7 +608,10 @@ public class PlayerActivity extends AppCompatActivity {
                     }
                 } else if (s == Player.STATE_ENDED) {
                     Log.d(TAG, "STATE_ENDED hasNext=" + (episodeManager != null && episodeManager.hasNext()));
-                    if (episodeManager != null && episodeManager.hasNext()) {
+                    if (isOffline) {
+                        clearOfflinePos();
+                        playNextOffline();
+                    } else if (episodeManager != null && episodeManager.hasNext()) {
                         episodeManager.playNext();
                     }
                 } else {
@@ -633,11 +642,15 @@ public class PlayerActivity extends AppCompatActivity {
                     handler.post(() -> recreatePlayerWithSwDecoder());
                     return;
                 }
-                // 按响应码切换
+                // 按响应码切换：响应实际是 m3u8（NAS 代理直链/清单）但按渐进式播时，
+                // 解析必然失败 → 此处按真实 Content-Type 升级为 HLS 播放
                 int code = OkHttpExoDataSource.lastResponseCode;
-                if (code == 200 && !useHls && cloudStreamManager.hasDirectUrl()) {
+                String respCt = OkHttpExoDataSource.lastContentType == null
+                        ? "" : OkHttpExoDataSource.lastContentType.toLowerCase();
+                boolean respIsM3u8 = respCt.contains("mpegurl");
+                if (!useHls && respIsM3u8) {
                     useHls = true;
-                    Log.d(TAG, "响应200，切换到HLS");
+                    Log.d(TAG, "响应为 m3u8(" + code + ")，切换到HLS");
                     switchMediaSource(true);
                     return;
                 } else if (code == 206 && useHls && cloudStreamManager.hasDirectUrl()) {
@@ -759,6 +772,92 @@ public class PlayerActivity extends AppCompatActivity {
             episodeManager.loadList(parentGuid);
     }
 
+    // ==================== 离线播放（6.1~6.4） ====================
+
+    /** 离线播放：统一经 CacheDataSource 读 SimpleCache（Progressive/HLS 同路径），无网络请求 */
+    private void startOfflinePlayback() {
+        OfflineManager om = OfflineManager.getInstance(this);
+        om.ensureInitialized();
+        DownloadDbHelper.DownloadRecord r = om.getRecord(itemGuid);
+        if (r == null || r.streamUri == null || r.streamUri.isEmpty()
+                || r.state != com.google.android.exoplayer2.offline.Download.STATE_COMPLETED) {
+            Log.w(TAG, "离线缓存不可用，回退在线播放: guid=" + itemGuid);
+            Toast.makeText(this, "离线缓存不可用，已回退在线播放", Toast.LENGTH_SHORT).show();
+            loadPlayInfo();
+            return;
+        }
+        if (r.title != null && !r.title.isEmpty()) itemTitle = r.title;
+        if (r.tvTitle != null && !r.tvTitle.isEmpty()) itemTV = r.tvTitle;
+        if (r.seasonNum > 0) seasonNumber = r.seasonNum;
+        tvTitle.setText((itemTV != null && !itemTV.isEmpty() ? itemTV + " " : "")
+                + (itemTitle != null ? itemTitle : "离线播放"));
+
+        String uri = r.streamUri;
+        // HLS 判定用入队时落库的 r.hls（getStream is_m3u8）。
+        // 115 直链形如 /m3u8/<id> 无 .m3u8 后缀，按 URI 后缀判断会把 HLS 缓存当渐进流打开，
+        // 渐进式缓存键与 HLS 分片键不一致 → cache-only 直接 "PlaceholderDataSource cannot be opened"。
+        useHls = r.hls == 1 || (r.hls == -1 && uri.contains(".m3u8"));
+        savedPlaybackUrl = uri;
+        Log.d(TAG, "离线播放: guid=" + itemGuid + " hls=" + useHls + " dbHls=" + r.hls + " uri=" + uri);
+
+        // 6.3 本地进度记忆：优先本地，其次详情页传入的在线进度作种子
+        SharedPreferences sp = getSharedPreferences("fntv_prefs", MODE_PRIVATE);
+        long saved = sp.getLong("offline_pos_" + itemGuid, 0);
+        if (saved > 0) {
+            seekTs = saved;
+        } else {
+            long seed = getIntent().getLongExtra("ts", 0);
+            if (seed > 0) seekTs = seed * 1000L;
+        }
+
+        com.google.android.exoplayer2.upstream.DataSource.Factory f = om.offlinePlaybackDataSourceFactory();
+        if (useHls) {
+            player.setMediaSource(new com.google.android.exoplayer2.source.hls.HlsMediaSource.Factory(f)
+                    .createMediaSource(MediaItem.fromUri(uri)));
+            Log.d(TAG, "离线播放器: HLS");
+        } else {
+            player.setMediaSource(new com.google.android.exoplayer2.source.ProgressiveMediaSource.Factory(f, new DefaultExtractorsFactory())
+                    .createMediaSource(MediaItem.fromUri(uri)));
+            Log.d(TAG, "离线播放器: 渐进式");
+        }
+        player.prepare();
+        player.setPlayWhenReady(true);
+
+        // 6.2 本地弹幕
+        if (danmuManager != null) danmuManager.loadDanmuOffline(itemGuid);
+    }
+
+    /** 切换到另一离线剧集（自动连播复用） */
+    private void switchToOfflineEpisode(String guid, String title) {
+        introSkipped = false;
+        outroSkipped = false;
+        itemGuid = guid;
+        itemTitle = title;
+        mediaGuid = null;
+        seeked = false;
+        seekTs = 0;
+        episodeManager.reset();
+        startOfflinePlayback();
+    }
+
+    /** 离线自动连播：取同剧下一已完成集（7.1 配套） */
+    private void playNextOffline() {
+        OfflineManager om = OfflineManager.getInstance(this);
+        DownloadDbHelper.DownloadRecord next = om.nextCachedEpisode(itemGuid, itemTV);
+        if (next == null) {
+            Log.d(TAG, "离线连播：无下一已完成集，退出");
+            finish();
+            return;
+        }
+        Toast.makeText(this, "自动连播: " + next.title, Toast.LENGTH_SHORT).show();
+        switchToOfflineEpisode(next.itemGuid, next.title);
+    }
+
+    private void clearOfflinePos() {
+        getSharedPreferences("fntv_prefs", MODE_PRIVATE)
+                .edit().remove("offline_pos_" + itemGuid).apply();
+    }
+
     /** 下载 ASS 字幕 → 合并双语 Dialogue → 保存到缓存 */
     /** 直播频道播放（直接用 live_channels 返回的地址） */
     private void playLiveStream(String url) {
@@ -832,7 +931,10 @@ public class PlayerActivity extends AppCompatActivity {
                     if (firstReady) { showCtrl(true); firstReady = false; }
                     btnPlayPause.setText(player.isPlaying() ? "暂停" : "播放");
                 } else if (s == Player.STATE_ENDED) {
-                    if (episodeManager != null && episodeManager.hasNext()) episodeManager.playNext();
+                    if (isOffline) {
+                        clearOfflinePos();
+                        playNextOffline();
+                    } else if (episodeManager != null && episodeManager.hasNext()) episodeManager.playNext();
                 }
             }
             int retryCount = 0;
@@ -1022,10 +1124,13 @@ public class PlayerActivity extends AppCompatActivity {
     }
 
     private void switchMediaSource(boolean toHls) {
-        if (player == null || !cloudStreamManager.hasDirectUrl()) return;
+        if (player == null) return;
+        // 直链模式用直链 URL；NAS 代理模式退回当前播放 URL（savedPlaybackUrl）
+        String u = cloudStreamManager.hasDirectUrl()
+                ? cloudStreamManager.getCloudDirectUrl() : savedPlaybackUrl;
+        if (u == null || u.isEmpty()) return;
         OkHttpExoDataSource.resetLoadedBytes();
         handler.post(() -> {
-            String u = cloudStreamManager.getCloudDirectUrl();
             com.google.android.exoplayer2.upstream.DataSource.Factory f2 = () -> new OkHttpExoDataSource(apiManager.getStreamClient());
             com.google.android.exoplayer2.source.MediaSource ms = toHls
                     ? new com.google.android.exoplayer2.source.hls.HlsMediaSource.Factory(f2).createMediaSource(MediaItem.fromUri(u))
@@ -1452,6 +1557,12 @@ public class PlayerActivity extends AppCompatActivity {
     private void saveProgress() {
         if (player == null || player.getPlaybackState() != Player.STATE_READY) return;
         long p = player.getCurrentPosition(); if (p <= 0) return;
+        if (isOffline) {
+            // 离线播放：仅本地记忆进度（6.3），不写服务器观看记录
+            getSharedPreferences("fntv_prefs", MODE_PRIVATE)
+                    .edit().putLong("offline_pos_" + itemGuid, p).apply();
+            return;
+        }
         long ts = p / 1000;
         Map<String, Object> r = new HashMap<>();
         r.put("item_guid", itemGuid); r.put("media_guid", mediaGuid);
@@ -1631,11 +1742,8 @@ public class PlayerActivity extends AppCompatActivity {
     }
 
     private void restoreOrientation() {
-        if (isTvDevice()) {
-            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
-        } else {
-            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
-        }
+        // 退出/暂停播放时恢复跟随系统旋转锁定策略，不再强制横屏(TV)/竖屏(手机)
+        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
     }
 
     @Override protected void onPause() {

@@ -13,6 +13,8 @@ import java.nio.charset.Charset;
 public class AuthInterceptor implements Interceptor {
     private String token;
     private String referer;
+    /** NAS host（登录时由 FnApiManager 注入）；非该 host 的请求不注入任何 NAS 鉴权头 */
+    private String nasHost;
 
     public void setToken(String token) {
         this.token = token;
@@ -26,9 +28,22 @@ public class AuthInterceptor implements Interceptor {
         this.referer = referer;
     }
 
+    public void setNasHost(String host) {
+        this.nasHost = host == null ? null : host.toLowerCase();
+    }
+
     @Override
     public Response intercept(Chain chain) throws IOException {
         Request original = chain.request();
+
+        // 云盘直链（115/优酷等）与 NAS 不同源：不注入 Authx/Authorization/
+        // Cookie mode=relay 等 NAS 鉴权头。此前无差别注入会把 NAS 凭据泄露给
+        // 第三方 CDN，并覆盖数据源为云盘设置的 Cookie，还强制 JSON Content-Type，
+        // 是云盘内容下载卡 0 字节的隐患。
+        if (nasHost != null && !nasHost.equals(original.url().host().toLowerCase())) {
+            android.util.Log.d("AuthInterceptor", "非 NAS 请求，跳过鉴权头: " + original.url().host());
+            return chain.proceed(original);
+        }
 
         String urlPath = original.url().encodedPath();
         String jsonBody = null;

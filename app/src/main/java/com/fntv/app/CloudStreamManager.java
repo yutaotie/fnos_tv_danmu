@@ -83,6 +83,8 @@ public class CloudStreamManager {
     private int qualityIndex = 1;
     private String[] qualityLabels;
     private String[] qualityUrls;
+    /** 每档直链是否为 m3u8（NAS 代理模式下据此选 HLS/渐进式播放器） */
+    private boolean[] qualityIsM3u8 = new boolean[0];
     private int qualityCount = 0;
 
     // ExoPlayer 引用（用于音轨/字幕切换，由外部注入）
@@ -134,6 +136,14 @@ public class CloudStreamManager {
         if (!hls && !cloudDirectUrl.isEmpty()) {
             hls = isStrmFile;
             Log.d(TAG, "直链模式: isStrm=" + isStrmFile + " useHls=" + hls);
+        }
+        // NAS 代理直链：代理返回的是 directLinkQualities[qualityIndex] 的内容，
+        // 该直链为 m3u8 时必须用 HLS 播放器。此前只看代理 URL 是否含 .m3u8，
+        // 导致 m3u8 直链被当渐进流解析（UnrecognizedInputFormatException 死循环）。
+        if (!hls && cloudDirectUrl.isEmpty() && cloudDirectMode
+                && qualityIndex < qualityIsM3u8.length && qualityIsM3u8[qualityIndex]) {
+            hls = true;
+            Log.d(TAG, "NAS代理直链为 m3u8，使用 HLS 播放器");
         }
         return new PlaybackConfig(url, hls, chunkedMode);
     }
@@ -234,12 +244,14 @@ public class CloudStreamManager {
                                     qualityCount = sd.directLinkQualities.size();
                                     qualityLabels = new String[qualityCount];
                                     qualityUrls = new String[qualityCount];
+                                    qualityIsM3u8 = new boolean[qualityCount];
                                     for (int qi = 0; qi < qualityCount; qi++) {
                                         StreamResponse.DirectLinkQuality dlq = sd.directLinkQualities.get(qi);
                                         qualityLabels[qi] = dlq.resolution != null && !dlq.resolution.isEmpty()
                                                 ? dlq.resolution : ("画质" + qi);
                                         String u = dlq.url != null ? dlq.url.replace("\\u0026", "&") : "";
                                         qualityUrls[qi] = u;
+                                        qualityIsM3u8[qi] = dlq.isM3u8;
                                     }
                                     if (qualityIndex >= qualityCount) qualityIndex = 0;
                                     cloudDirectUrl = qualityUrls[qualityIndex];
@@ -260,10 +272,12 @@ public class CloudStreamManager {
                                 qualityCount = sd.directLinkQualities != null ? sd.directLinkQualities.size() : 0;
                                 if (qualityCount > 0) {
                                     qualityLabels = new String[qualityCount];
+                                    qualityIsM3u8 = new boolean[qualityCount];
                                     for (int qi = 0; qi < qualityCount; qi++) {
                                         StreamResponse.DirectLinkQuality q = sd.directLinkQualities.get(qi);
                                         qualityLabels[qi] = q.resolution != null && !q.resolution.isEmpty()
                                                 ? q.resolution : ("画质" + qi);
+                                        qualityIsM3u8[qi] = q.isM3u8;
                                     }
                                     if (qualityIndex >= qualityCount) qualityIndex = 0;
                                     cb.runOnUiThread(() -> {
@@ -310,6 +324,7 @@ public class CloudStreamManager {
         qualityCount = 0;
         qualityLabels = null;
         qualityUrls = null;
+        qualityIsM3u8 = new boolean[0];
     }
 
     // ========== 画质菜单 ==========

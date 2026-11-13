@@ -27,8 +27,12 @@ public class OkHttpExoDataSource extends BaseDataSource {
             new java.util.HashMap<>();
 
     private final OkHttpClient client;
+    /** 下载模式：禁用分块截断，交给 ExoPlayer 下载器顺序读取完整流 */
+    private final boolean downloadMode;
     private String rangeKey;
     private long rangePosition;
+    /** 本次 open 生效的分块大小（播放器全局设置优先；未设置时外部云直链自动 20MB） */
+    private int activeChunkSize;
 
     public static void setCloudCookie(String cookie) { cloudCookie = cookie; }
     private Response response;
@@ -40,8 +44,14 @@ public class OkHttpExoDataSource extends BaseDataSource {
     public static void setChunkedMode(int bytes) { chunkSize = bytes; }
 
     public OkHttpExoDataSource(OkHttpClient client) {
+        this(client, false);
+    }
+
+    /** downloadMode=true 用于离线下载：不截断流、不继承播放器 static chunkSize */
+    public OkHttpExoDataSource(OkHttpClient client, boolean downloadMode) {
         super(true);
         this.client = client;
+        this.downloadMode = downloadMode;
     }
 
     /** 播放新一集/切换画质时清空已下载统计 */
@@ -98,10 +108,25 @@ public class OkHttpExoDataSource extends BaseDataSource {
         Request.Builder builder = new Request.Builder()
                 .url(dataSpec.uri.toString());
 
-        // 分块模式：每次只请求 chunkSize 字节（如 10MB），避免云盘风控
+        // 分块模式：每次只请求 chunkSize 字节（如 20MB），避免云盘风控。
+        // 播放器全局设置优先；未设置时对外部云直链自动启用 20MB 分块
+        // （离线下载不经过播放器设置，NAS 自身 /v/api/v1/ 接口不分块）
+        if (downloadMode) {
+            // 离线下载：ExoPlayer ProgressiveDownloader/HlsDownloader 需要完整连续的流。
+            // 分块截断会让 CacheDataSource 把截断长度误判为文件总长，导致缓存损坏/提前完成；
+            // 同时不能继承播放器的 static chunkSize（播放云直链时会泄漏到下载）。
+            activeChunkSize = 0;
+        } else {
+            activeChunkSize = chunkSize;
+            if (activeChunkSize == 0) {
+                String p = dataSpec.uri.getPath();
+                boolean nasApi = p != null && p.contains("/v/api/v1/");
+                if (!nasApi) activeChunkSize = 20 * 1024 * 1024;
+            }
+        }
         long rangeEnd = -1;
-        if (chunkSize > 0 && dataSpec.length > chunkSize) {
-            rangeEnd = dataSpec.position + chunkSize - 1;
+        if (activeChunkSize > 0 && dataSpec.length > activeChunkSize) {
+            rangeEnd = dataSpec.position + activeChunkSize - 1;
         }
         String range = rangeEnd > 0
                 ? "bytes=" + dataSpec.position + "-" + rangeEnd
@@ -130,6 +155,28 @@ public class OkHttpExoDataSource extends BaseDataSource {
             throw new IOException("HTTP " + response.code() + " " + response.message());
         }
         String ct = response.header("Content-Type");
+        // 防御：鉴权失败等场景服务端返回 HTTP 200 + application/json 错误体
+        // （如 {"msg":"Auth Failed","code":-2}）；转码未就绪时 media 播放链接
+        // 返回 HTTP 200 + text/html 的 SPA 页面。若放行，ExoPlayer 会把错误内容
+        // 当媒体缓存并标记"已完成"（静默损坏）或无限解析失败。此处抛 IOException，
+        // 使下载任务进入 FAILED（可重试）而非假完成。
+        boolean badBody = false;
+        if (ct != null) {
+            String ctl = ct.toLowerCase();
+            badBody = ctl.contains("application/json") || ctl.contains("text/html");
+        }
+        if (badBody) {
+            String errBody = "";
+            try {
+                if (response.body() != null) {
+                    byte[] peek = new byte[256];
+                    int n = response.body().byteStream().read(peek);
+                    if (n > 0) errBody = new String(peek, 0, n, "UTF-8");
+                }
+            } catch (Exception ignored) {}
+            response.close();
+            throw new IOException("服务器返回 " + ct + " 而非媒体流: " + errBody);
+        }
         long len = response.body() != null ? response.body().contentLength() : -1;
         // 解析总大小：206 响应优先取 Content-Range 中的完整长度
         lastTotalLength = 0;
@@ -156,7 +203,7 @@ public class OkHttpExoDataSource extends BaseDataSource {
 
         // 返回实际可读长度（分块模式下不超过 chunkSize）
         long contentLen = response.body().contentLength();
-        if (chunkSize > 0 && contentLen > chunkSize) contentLen = chunkSize;
+        if (activeChunkSize > 0 && contentLen > activeChunkSize) contentLen = activeChunkSize;
         return contentLen;
     }
 
@@ -164,9 +211,9 @@ public class OkHttpExoDataSource extends BaseDataSource {
     public int read(byte[] buffer, int offset, int readLength) throws IOException {
         if (bufferedInput == null) return -1;
         // 分块模式下，读完块大小后截断
-        if (chunkSize > 0 && bytesRead >= chunkSize) return -1;
+        if (activeChunkSize > 0 && bytesRead >= activeChunkSize) return -1;
         int maxRead = readLength;
-        if (chunkSize > 0) maxRead = (int) Math.min(readLength, chunkSize - bytesRead);
+        if (activeChunkSize > 0) maxRead = (int) Math.min(readLength, activeChunkSize - bytesRead);
         int n = bufferedInput.read(buffer, offset, maxRead);
         if (n > 0) {
             bytesRead += n;

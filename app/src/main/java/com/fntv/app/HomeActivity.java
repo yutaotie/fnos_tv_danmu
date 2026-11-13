@@ -20,6 +20,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.fntv.app.api.FnApiManager;
 import com.fntv.app.api.model.*;
 import com.fntv.app.util.SimpleImageLoader;
+import com.google.android.exoplayer2.offline.Download;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -42,6 +43,27 @@ public class HomeActivity extends AppCompatActivity {
     private UpdateManager updateManager;
     private RelativeLayout rlDecoderSetting, rlDanmuSetting, rlSeekStep, rlBufferTime;
     private TextView tvSeekStepValue, tvBufferTimeValue;
+    private RelativeLayout rlOfflineDownloads;
+    private TextView tvOfflineCount;
+
+    // 离线缓存（4.1）：剧集列表缓存角标与状态同步
+    private final List<TextView> cacheBadgeViews = new ArrayList<>();
+    private final List<String> cacheBadgeGuids = new ArrayList<>();
+    private OfflineManager.StateListener offlineUiListener;
+    /** 本轮实时进度 guid → [bytes, speedB/s]（OfflineManager.pollLiveProgress） */
+    private Map<String, long[]> liveProgress = java.util.Collections.emptyMap();
+    /** 角标进度轮询：让列表页角标实时显示百分比/速度（与我的下载页同源，监听器整块完成才回调） */
+    private final android.os.Handler offlinePollHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable offlineProgressPoller = new Runnable() {
+        @Override public void run() {
+            try {
+                liveProgress = OfflineManager.getInstance(HomeActivity.this).pollLiveProgress();
+                if (!liveProgress.isEmpty()) refreshCacheBadges();
+            } catch (Exception ignored) {}
+            offlinePollHandler.postDelayed(this, 500);
+        }
+    };
 
     private int currentTab = 0;
     private final List<MediaDbItem> mediaLibraries = new ArrayList<>();
@@ -126,6 +148,7 @@ public class HomeActivity extends AppCompatActivity {
         updateManager.setup();
         setupFeedback();
         setupSearch();
+        initOfflineUi();
 
         switchTab(0);
         tvMoviesLoading.setVisibility(View.VISIBLE);
@@ -160,6 +183,8 @@ public class HomeActivity extends AppCompatActivity {
         tvSeekStepValue = findViewById(R.id.tvSeekStepValue);
         rlBufferTime = findViewById(R.id.rlBufferTime);
         tvBufferTimeValue = findViewById(R.id.tvBufferTimeValue);
+        rlOfflineDownloads = findViewById(R.id.rlOfflineDownloads);
+        tvOfflineCount = findViewById(R.id.tvOfflineCount);
         tvDanmuUrl = findViewById(R.id.tvDanmuUrl);
         tvSettingServer.setText(prefs.getString("host", ""));
 
@@ -176,6 +201,8 @@ public class HomeActivity extends AppCompatActivity {
 
     protected void onResume() {
         super.onResume();
+        offlinePollHandler.removeCallbacks(offlineProgressPoller);
+        offlinePollHandler.postDelayed(offlineProgressPoller, 500);
         if (savedDetailItem != null) {
             buildDetailPage(savedDetailItem, savedDetailInfo);
         } else if (currentTab == 0 && !mediaLibraries.isEmpty() && overviewBuilt && showingOverview) {
@@ -187,6 +214,12 @@ public class HomeActivity extends AppCompatActivity {
         } else if (currentTab == 0 && !overviewBuilt && showingOverview) {
             loadOverview();
         }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        offlinePollHandler.removeCallbacks(offlineProgressPoller);
     }
 
 
@@ -1049,6 +1082,149 @@ public class HomeActivity extends AppCompatActivity {
     }
 
 
+    // ==================== 离线缓存 UI（4.1/4.2/5.4/6.4） ====================
+
+
+    private void initOfflineUi() {
+        // 主线程首次获取：OfflineManager 的 DownloadManager 回调绑定主线程 Looper
+        OfflineManager om = OfflineManager.getInstance(this);
+        om.ensureInitialized();
+        // 应用启动时恢复未完成任务（spec 断点续传 / 7.2 杀进程续传）：
+        // DownloadService ACTION_INIT → resumeDownloads()，排队/等待任务按 Requirements 自动续跑；
+        // 在前台 Activity 里启动服务，避免进程被后台 Job 拉起时触发 Android 12 FGS 限制
+        om.resumePendingDownloads();
+        offlineUiListener = this::refreshCacheBadges;
+        om.addListener(offlineUiListener);
+        updateOfflineCount();
+    }
+
+    private void refreshCacheBadges() {
+        for (int i = 0; i < cacheBadgeViews.size() && i < cacheBadgeGuids.size(); i++) {
+            applyCacheBadge(cacheBadgeViews.get(i), cacheBadgeGuids.get(i));
+        }
+        updateOfflineCount();
+    }
+
+    /** 按元数据状态更新单集缓存角标（OfflineManager 在主线程回调） */
+    private void applyCacheBadge(TextView b, String guid) {
+        DownloadDbHelper.DownloadRecord r = OfflineManager.getInstance(this).getRecord(guid);
+        String text;
+        int color;
+        if (r == null) {
+            text = "缓存";
+            color = 0xFF9FA8DA;
+        } else {
+            switch (r.state) {
+                case Download.STATE_COMPLETED:
+                    text = "已缓存"; color = 0xFF81C784; break;
+                case Download.STATE_DOWNLOADING:
+                    long[] lp = liveProgress.get(guid);
+                    long speed = lp == null ? 0 : lp[1];
+                    if (r.estimated > 0) {
+                        int pct = Math.min(99, (int) (r.bytes * 100 / r.estimated));
+                        text = "↓ " + pct + "%" + (speed > 0 ? " · " + compactSpeed(speed) : "");
+                    } else if (r.bytes > 0) {
+                        // HLS 无可靠预估：显示真实已下载量
+                        text = "↓ " + compactBytes(r.bytes) + (speed > 0 ? " · " + compactSpeed(speed) : "");
+                    } else {
+                        text = speed > 0 ? "↓ " + compactSpeed(speed) : "下载中";
+                    }
+                    color = 0xFF64B5F6; break;
+                case Download.STATE_QUEUED:
+                    text = "排队中"; color = 0xFF64B5F6; break;
+                case Download.STATE_STOPPED:
+                    text = "已暂停"; color = 0xFFFFB74D; break;
+                case Download.STATE_FAILED:
+                    text = "失败"; color = 0xFFE57373; break;
+                default:
+                    text = "缓存"; color = 0xFF9FA8DA; break;
+            }
+        }
+        b.setText(text);
+        b.setTextColor(color);
+    }
+
+    /** 角标用的紧凑速度文本 */
+    private String compactSpeed(long bps) {
+        if (bps >= 1024 * 1024) {
+            return String.format(java.util.Locale.US, "%.1fM/s", bps / 1048576f);
+        }
+        if (bps >= 1024) return (bps / 1024) + "K/s";
+        return bps + "B/s";
+    }
+
+    /** 角标用的紧凑体积文本 */
+    private String compactBytes(long bytes) {
+        if (bytes >= 1024 * 1024 * 1024) {
+            return String.format(java.util.Locale.US, "%.1fG", bytes / 1073741824f);
+        }
+        if (bytes >= 1024 * 1024) return String.format(java.util.Locale.US, "%.0fM", bytes / 1048576f);
+        if (bytes >= 1024) return (bytes / 1024) + "K";
+        return bytes + "B";
+    }
+
+    /** 缓存角标点击分派：未缓存→清晰度弹窗；已缓存→离线播放；失败→重试（6.4） */
+    private void onCacheBadgeClick(PlayListItem ep) {
+        OfflineManager om = OfflineManager.getInstance(this);
+        DownloadDbHelper.DownloadRecord r = om.getRecord(ep.guid);
+        if (r == null) {
+            CacheDialogHelper.showForEpisode(this, ep);
+        } else if (r.state == Download.STATE_COMPLETED) {
+            launchOfflinePlayer(r, ep.ts > 0 ? ep.ts : 0);
+        } else if (r.state == Download.STATE_FAILED) {
+            Toast.makeText(this, "重试中…", Toast.LENGTH_SHORT).show();
+            om.retry(ep.guid);
+        } else if (r.state == Download.STATE_DOWNLOADING || r.state == Download.STATE_QUEUED) {
+            Toast.makeText(this, "下载中，可在 设置-我的下载 中管理", Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "任务已暂停，可在 设置-我的下载 中继续", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /** 从已缓存元数据直达离线播放（6.4，与我的下载入口同源）；seedTs 为在线进度（秒）作续播种子 */
+    private void launchOfflinePlayer(DownloadDbHelper.DownloadRecord r, long seedTs) {
+        Intent intent = new Intent(this, PlayerActivity.class);
+        intent.putExtra("offline", true);
+        intent.putExtra("guid", r.itemGuid);
+        intent.putExtra("title", r.title);
+        intent.putExtra("tv_title", r.tvTitle != null ? r.tvTitle : "");
+        intent.putExtra("episode_number", r.episodeNum);
+        intent.putExtra("poster", r.poster);
+        if (seedTs > 0) intent.putExtra("ts", seedTs);
+        startActivity(intent);
+    }
+
+    private void updateOfflineCount() {
+        if (tvOfflineCount == null) return;
+        int n = 0, downloading = 0, failed = 0;
+        for (DownloadDbHelper.DownloadRecord r : OfflineManager.getInstance(this).getDb().getAll()) {
+            if (r.state == Download.STATE_COMPLETED) n++;
+            else if (r.state == Download.STATE_DOWNLOADING || r.state == Download.STATE_QUEUED) downloading++;
+            else if (r.state == Download.STATE_FAILED) failed++;
+        }
+        // 设置页入口实时摘要："3 集 · ↓1 · 失败1"，下载中随轮询刷新
+        StringBuilder sb = new StringBuilder();
+        if (n > 0) sb.append(n).append(" 集");
+        if (downloading > 0) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append("↓下载中").append(downloading);
+        }
+        if (failed > 0) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append("失败").append(failed);
+        }
+        tvOfflineCount.setText(sb.toString());
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (offlineUiListener != null) {
+            OfflineManager.getInstance(this).removeListener(offlineUiListener);
+        }
+    }
+
+
     // ==================== 详情页（getPlayInfo → 按类型展示） ====================
 
 
@@ -1511,6 +1687,8 @@ public class HomeActivity extends AppCompatActivity {
     private void loadEpisodesForSeason(String seasonGuid, int seasonNumber, PlayListItem original) {
         showingEpisodes = true;
         moviesContainer.removeAllViews();
+        cacheBadgeViews.clear();
+        cacheBadgeGuids.clear();
         // 标题
         TextView h = new TextView(this);
         h.setLayoutParams(new LinearLayout.LayoutParams(
@@ -1529,13 +1707,39 @@ public class HomeActivity extends AppCompatActivity {
                                    Response<ApiResponse<List<PlayListItem>>> response) {
                 if (!response.isSuccessful() || response.body() == null || response.body().code != 0
                         || response.body().data == null || response.body().data.isEmpty()) return;
-                for (PlayListItem ep : response.body().data) {
+                List<PlayListItem> eps = response.body().data;
+                moviesContainer.addView(makeSeasonCacheBar(eps));
+                moviesContainer.addView(makeSpacer(8));
+                for (PlayListItem ep : eps) {
                     moviesContainer.addView(makeEpisodeItem(ep, ep.guid.equals(original.guid)));
                     moviesContainer.addView(makeSpacer(8));
                 }
             }
             @Override public void onFailure(Call<ApiResponse<List<PlayListItem>>> call, Throwable t) {}
         });
+    }
+
+    /** 整季批量缓存入口按钮（4.2，剧集列表页共用） */
+    private View makeSeasonCacheBar(List<PlayListItem> eps) {
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER);
+        bar.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        Button btn = new Button(this);
+        btn.setBackgroundResource(R.drawable.bg_btn_primary);
+        btn.setText("⬇ 缓存整季");
+        btn.setTextColor(0xFFEEEEEE);
+        btn.setTextSize(13);
+        btn.setFocusable(true);
+        btn.setPadding(24, 6, 24, 6);
+        btn.setOnFocusChangeListener((v, hasFocus) -> {
+            btn.setScaleX(hasFocus ? 1.06f : 1.0f);
+            btn.setScaleY(hasFocus ? 1.06f : 1.0f);
+        });
+        btn.setOnClickListener(v -> CacheDialogHelper.showForSeason(HomeActivity.this, eps));
+        bar.addView(btn);
+        return bar;
     }
 
     /** 显示季列表 */
@@ -1597,6 +1801,8 @@ public class HomeActivity extends AppCompatActivity {
     private void showEpisodes(List<PlayListItem> eps, int sn, PlayListItem original) {
         showingEpisodes = true;
         moviesContainer.removeAllViews();
+        cacheBadgeViews.clear();
+        cacheBadgeGuids.clear();
 
         // 标题
         TextView h = new TextView(this);
@@ -1607,6 +1813,8 @@ public class HomeActivity extends AppCompatActivity {
         h.setTextColor(0xFFEEEEEE); h.setTextSize(21);
         h.setTypeface(Typeface.DEFAULT_BOLD);
         moviesContainer.addView(h);
+        moviesContainer.addView(makeSpacer(8));
+        moviesContainer.addView(makeSeasonCacheBar(eps));
         moviesContainer.addView(makeSpacer(8));
 
         for (PlayListItem ep : eps) {
@@ -1698,6 +1906,22 @@ public class HomeActivity extends AppCompatActivity {
             playEp.setOnClickListener(v -> launchPlayer(eg, et, eTV, eEp, epPo, epCa, epTs, epDu, epPG));
             card.addView(playEp);
         }
+
+        // 单集缓存角标（4.1）：未缓存显示"缓存"，下载中显示进度，已缓存可直达离线播放
+        TextView cacheBadge = new TextView(this);
+        cacheBadge.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        cacheBadge.setGravity(Gravity.CENTER);
+        cacheBadge.setTextSize(12);
+        cacheBadge.setPadding(16, 0, 8, 0);
+        cacheBadge.setFocusable(true);
+        cacheBadge.setOnFocusChangeListener((v, hasFocus) ->
+                cacheBadge.setBackgroundColor(hasFocus ? 0x33FFFFFF : 0x00000000));
+        applyCacheBadge(cacheBadge, eg);
+        cacheBadge.setOnClickListener(v -> onCacheBadgeClick(ep));
+        cacheBadgeViews.add(cacheBadge);
+        cacheBadgeGuids.add(eg);
+        card.addView(cacheBadge);
         return card;
     }
 
@@ -1923,6 +2147,11 @@ public class HomeActivity extends AppCompatActivity {
 
 
     private void setupSettings() {
+        // 我的下载（5.4）：设置页入口，遥控器焦点可达、触屏可点
+        rlOfflineDownloads.setOnClickListener(v ->
+                startActivity(new Intent(this, MyDownloadsActivity.class)));
+        updateOfflineCount();
+
         tvSettingUsername.setText("用户名: " + prefs.getString("user", ""));
         String d = prefs.getString(PREF_DECODER, "hardware");
         tvDecoderValue.setText("hardware".equals(d) ? "硬解" : "软解");
