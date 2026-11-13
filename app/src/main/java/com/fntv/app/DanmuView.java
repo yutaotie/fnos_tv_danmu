@@ -77,43 +77,10 @@ public class DanmuView extends View {
 
     @Override
     public boolean onTouchEvent(android.view.MotionEvent event) {
-        if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
-            float tx = event.getX();
-            float ty = event.getY();
-
-            // 点击空白处恢复暂停的弹幕
-            if (pausedItem != null) {
-                pausedItem.paused = false;
-                pausedItem = null;
-                invalidate();
-                return true;
-            }
-
-            // 检测点击了哪条弹幕（滚动弹幕）
-            for (DanmuItem a : activeScroll) {
-                float textH = fontSize * screenDensity;
-                if (tx >= a.x && tx <= a.x + a.tw && ty >= a.y - textH && ty <= a.y) {
-                    a.paused = true;
-                    pausedItem = a;
-                    pausedTime = System.currentTimeMillis();
-                    invalidate();
-                    return true;
-                }
-            }
-
-            // 检测点击了哪条弹幕（固定弹幕）
-            for (DanmuItem a : activeStatic) {
-                float textH = fontSize * screenDensity;
-                if (tx >= a.x && tx <= a.x + a.tw && ty >= a.y - textH && ty <= a.y) {
-                    a.paused = true;
-                    pausedItem = a;
-                    pausedTime = System.currentTimeMillis();
-                    invalidate();
-                    return true;
-                }
-            }
-        }
-        // 不拦截触摸事件，让下层控件处理
+        // 不消费任何触摸：此视图盖在播放手势层之上，
+        // 之前“点弹幕暂停弹幕”会吃掉 DOWN 事件，导致
+        // 单击出控制栏 / 双击快进快退 / 长按倍速在弹幕漂到
+        // 手指下方时随机失效（返回键点不到也是同因）。
         return false;
     }
 

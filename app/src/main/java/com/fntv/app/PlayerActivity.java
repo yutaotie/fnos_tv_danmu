@@ -42,6 +42,9 @@ public class PlayerActivity extends AppCompatActivity {
     private ImageView btnLock;
     private TextView tvTitle, tvDanmuStatus, tvDanmuMatch, tvSpeedHint, infoTextAudio, infoTextExtra;
     private Button btnCloudMode, btnBrightness, btnSkip;
+    private Button btnRotate;
+    private TextView tvGestureHint;
+    private boolean userPortrait = false; // 手动切换后的方向选择（恢复界面时尊重用户选择）
     private boolean introSkipped = false, outroSkipped = false;
     private float speedBeforeLongPress = 1.0f;
     private DanmuView danmuView;
@@ -153,6 +156,8 @@ public class PlayerActivity extends AppCompatActivity {
         tvSpeedHint = findViewById(R.id.tvSpeedHint);
         topBar = findViewById(R.id.topBar);
         controller = findViewById(R.id.controller);
+        btnRotate = findViewById(R.id.btnRotate);
+        tvGestureHint = findViewById(R.id.tvGestureHint);
         controller.setOnTouchListener((v, e) -> true);
         topBar.setOnTouchListener((v, e) -> true);
         infoPanel = findViewById(R.id.infoPanel);
@@ -184,9 +189,59 @@ public class PlayerActivity extends AppCompatActivity {
             subtitleMerge.setSubtitleView(playerView.getSubtitleView());
         }
 
+        // VidHub 式手势层：双击(左退/右进/中暂停)、左侧上下滑亮度、右侧上下滑音量、
+        // 横滑拖进度(松手生效)、长按 2x 倍速、单击收/放控制栏
         findViewById(android.R.id.content).setOnTouchListener(new View.OnTouchListener() {
             private boolean longPressing = false;
             private android.os.Handler longPressHandler = new android.os.Handler(Looper.getMainLooper());
+            // 双击检测
+            private long lastTapUp = 0;
+            private int lastTapZone = -1;
+            private Runnable pendingSingleTap = null;
+            // 滑动手势
+            private static final int G_NONE = 0, G_BRIGHT = 1, G_VOLUME = 2, G_SEEK = 3;
+            private int gestureMode = G_NONE;
+            private float downX, downY;
+            private float baseBrightness = 0.5f;
+            private int baseVolume = 0;
+            private long seekBaseMs = 0, seekTargetMs = -1;
+
+            private final Runnable hideHintR = () -> { if (tvGestureHint != null) tvGestureHint.setVisibility(View.GONE); };
+            private final Runnable longPressR = () -> {
+                longPressing = true;
+                cancelPendingSingleTap();
+                if (player != null) {
+                    speedBeforeLongPress = player.getPlaybackParameters().speed;
+                    player.setPlaybackSpeed(2.0f);
+                    danmuView.setPlaybackSpeed(2.0f);
+                    showCtrl(false);
+                    if (tvSpeedHint != null) {
+                        tvSpeedHint.setVisibility(View.VISIBLE);
+                    }
+                }
+            };
+
+            private void showHint(String text) {
+                if (tvGestureHint == null) return;
+                tvGestureHint.setText(text);
+                tvGestureHint.setVisibility(View.VISIBLE);
+                longPressHandler.removeCallbacks(hideHintR);
+                longPressHandler.postDelayed(hideHintR, 1200);
+            }
+
+            private void cancelPendingSingleTap() {
+                if (pendingSingleTap != null) {
+                    longPressHandler.removeCallbacks(pendingSingleTap);
+                    pendingSingleTap = null;
+                }
+            }
+
+            private int zoneOf(float x, float w) {
+                if (x < w / 3f) return 0;
+                if (x > w * 2f / 3f) return 2;
+                return 1;
+            }
+
             @Override public boolean onTouch(View v, android.view.MotionEvent event) {
                 if (isLocked) {
                     if (event.getAction() == android.view.MotionEvent.ACTION_DOWN) {
@@ -197,22 +252,65 @@ public class PlayerActivity extends AppCompatActivity {
                 switch (event.getAction()) {
                     case android.view.MotionEvent.ACTION_DOWN:
                         longPressing = false;
-                        longPressHandler.postDelayed(() -> {
-                            longPressing = true;
-                            if (player != null) {
-                                speedBeforeLongPress = player.getPlaybackParameters().speed;
-                                player.setPlaybackSpeed(2.0f);
-                                danmuView.setPlaybackSpeed(2.0f);
-                                showCtrl(false);
-                                if (tvSpeedHint != null) {
-                                    tvSpeedHint.setVisibility(View.VISIBLE);
-                                }
-                            }
-                        }, 500);
+                        gestureMode = G_NONE;
+                        seekTargetMs = -1;
+                        downX = event.getX();
+                        downY = event.getY();
+                        longPressHandler.postDelayed(longPressR, 500);
                         return true;
+                    case android.view.MotionEvent.ACTION_MOVE: {
+                        if (longPressing) return true;
+                        float dx = event.getX() - downX;
+                        float dy = event.getY() - downY;
+                        if (gestureMode == G_NONE && (Math.abs(dx) > 24 || Math.abs(dy) > 24)) {
+                            cancelPendingSingleTap();
+                            if (Math.abs(dy) > Math.abs(dx) * 1.2f) {
+                                int zone = zoneOf(downX, v.getWidth());
+                                if (zone == 0) {
+                                    gestureMode = G_BRIGHT;
+                                    android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+                                    baseBrightness = lp.screenBrightness < 0 ? 0.5f : lp.screenBrightness;
+                                } else if (zone == 2) {
+                                    gestureMode = G_VOLUME;
+                                    android.media.AudioManager am = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+                                    baseVolume = am != null ? am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) : 0;
+                                }
+                            } else if (player != null && player.getDuration() > 0) {
+                                gestureMode = G_SEEK;
+                                seekBaseMs = player.getCurrentPosition();
+                                seekTargetMs = seekBaseMs;
+                            }
+                        }
+                        if (gestureMode == G_BRIGHT) {
+                            float b = Math.max(0.01f, Math.min(1f, baseBrightness + (downY - event.getY()) / 48f * 0.05f));
+                            android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+                            lp.screenBrightness = b;
+                            getWindow().setAttributes(lp);
+                            showHint("亮度 " + Math.round(b * 100) + "%");
+                        } else if (gestureMode == G_VOLUME) {
+                            android.media.AudioManager am = (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+                            if (am != null) {
+                                int max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC);
+                                int step = Math.max(1, max / 15);
+                                int vol = Math.max(0, Math.min(max, baseVolume + Math.round((downY - event.getY()) / 48f) * step));
+                                if (vol != baseVolume) {
+                                    baseVolume = vol;
+                                    am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, vol, 0);
+                                }
+                                showHint("音量 " + vol + "/" + max);
+                            }
+                        } else if (gestureMode == G_SEEK && player != null) {
+                            long dur = player.getDuration();
+                            long dms = (long) (dx * (dur / (v.getWidth() * 2f)));
+                            seekTargetMs = Math.max(0, Math.min(dur, seekBaseMs + dms));
+                            showHint(FormatUtils.fmt(seekTargetMs) + " / " + FormatUtils.fmt(dur));
+                        }
+                        return true;
+                    }
                     case android.view.MotionEvent.ACTION_UP:
-                    case android.view.MotionEvent.ACTION_CANCEL:
-                        longPressHandler.removeCallbacksAndMessages(null);
+                    case android.view.MotionEvent.ACTION_CANCEL: {
+                        // 只移除长按回调，不能全清（会误杀手势提示的 hideHintR / 单击回调）
+                        longPressHandler.removeCallbacks(longPressR);
                         if (longPressing) {
                             longPressing = false;
                             if (player != null) {
@@ -223,14 +321,50 @@ public class PlayerActivity extends AppCompatActivity {
                                 tvSpeedHint.setVisibility(View.GONE);
                             }
                             return true;
-                        } else {
-                            if (ctrlVis) {
-                                showCtrl(false);
-                            } else {
-                                showCtrl(true);
+                        }
+                        if (gestureMode == G_SEEK) {
+                            gestureMode = G_NONE;
+                            if (player != null && seekTargetMs >= 0) {
+                                player.seekTo(seekTargetMs);
+                                if (danmuManager != null) danmuManager.onSeekTo(seekTargetMs);
+                                updateTime();
                             }
+                            return true;
+                        }
+                        if (gestureMode != G_NONE) {
+                            gestureMode = G_NONE;
+                            return true;
+                        }
+                        if (event.getAction() == android.view.MotionEvent.ACTION_UP) {
+                            int zone = zoneOf(event.getX(), v.getWidth());
+                            long now = System.currentTimeMillis();
+                            if (now - lastTapUp < 320 && zone == lastTapZone) {
+                                // 双击：左退 / 右进 / 中间暂停
+                                cancelPendingSingleTap();
+                                lastTapUp = 0;
+                                if (zone == 0) {
+                                    seekRel(-seekStep);
+                                    showHint("快退 " + (seekStep / 1000) + " 秒");
+                                } else if (zone == 2) {
+                                    seekRel(seekStep);
+                                    showHint("快进 " + (seekStep / 1000) + " 秒");
+                                } else {
+                                    togglePlay();
+                                }
+                                return true;
+                            }
+                            lastTapUp = now;
+                            lastTapZone = zone;
+                            final boolean wasCtrl = ctrlVis;
+                            cancelPendingSingleTap();
+                            pendingSingleTap = () -> {
+                                pendingSingleTap = null;
+                                if (wasCtrl) showCtrl(false); else showCtrl(true);
+                            };
+                            longPressHandler.postDelayed(pendingSingleTap, 320);
                         }
                         return true;
+                    }
                 }
                 return false;
             }
@@ -327,6 +461,11 @@ public class PlayerActivity extends AppCompatActivity {
         }
         btnBack.setOnClickListener(v -> { restoreOrientation(); finish(); });
         btnDanmu.setOnClickListener(v -> danmuManager.showSettings());
+        // VidHub 式横竖屏手动切换：按钮文案指向"点按后将切往"的方向
+        if (btnRotate != null) {
+            btnRotate.setOnClickListener(v -> toggleManualOrientation());
+            updateRotateBtn();
+        }
         btnLock.setOnClickListener(v -> {
             isLocked = !isLocked;
             btnLock.setImageResource(isLocked ? R.drawable.ic_lock : R.drawable.ic_unlock);
@@ -334,6 +473,7 @@ public class PlayerActivity extends AppCompatActivity {
                 topBar.setVisibility(View.INVISIBLE);
                 controller.setVisibility(View.INVISIBLE);
                 btnLock.setVisibility(View.INVISIBLE);
+                if (btnRotate != null) btnRotate.setVisibility(View.INVISIBLE);
             } else {
                 showCtrl(true);
                 // 解锁后焦点还给视频区域
@@ -489,7 +629,11 @@ public class PlayerActivity extends AppCompatActivity {
         } else {
             loadPlayInfo();
         }
-        // 跟随系统屏幕旋转锁定策略（Manifest 已设 fullUser），不再强制横屏
+        // VidHub 式：进播放页默认横屏（SENSOR_LANDSCAPE 双向横屏均可）；
+        // TV 不旋转；播放页内可手动切回竖屏（btnRotate），退出恢复跟随系统(fullUser)
+        if (!isTvDevice()) {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        }
         hideSystemUi();
 
         // 控制栏隐藏时的进度时间浮层
@@ -1331,6 +1475,14 @@ public class PlayerActivity extends AppCompatActivity {
         topBar.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
         btnLock.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
         btnDanmu.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
+        if (btnRotate != null) btnRotate.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
+        // 控制栏亮起时隐藏弹幕（对齐 VidHub），熄灭时恢复显示；
+        // 仅在 VISIBLE↔INVISIBLE 间切换，避免覆盖弹幕开关的 GONE（已关闭）状态
+        if (show) {
+            if (danmuView.getVisibility() == View.VISIBLE) danmuView.setVisibility(View.INVISIBLE);
+        } else {
+            if (danmuView.getVisibility() == View.INVISIBLE) danmuView.setVisibility(View.VISIBLE);
+        }
         if (show) {
             updateTitle();
             resetHideTimer();
@@ -1344,6 +1496,7 @@ public class PlayerActivity extends AppCompatActivity {
     private final Runnable hideC = () -> {
         // 焦点在控制器按钮上时推迟隐藏，infoPanel/顶栏/无焦点时正常隐藏
         if (controller.hasFocus() || btnDanmu.hasFocus() || btnLock.hasFocus()
+                || (btnRotate != null && btnRotate.hasFocus())
                 || btnCloudMode.hasFocus() || btnBrightness.hasFocus() || btnSkip.hasFocus()
                 || btnInfo.hasFocus() || btnBack.hasFocus()
                 || (btnHdrToggle != null && btnHdrToggle.hasFocus())
@@ -1370,6 +1523,7 @@ public class PlayerActivity extends AppCompatActivity {
         btnBack.setOnFocusChangeListener(l);
         btnDanmu.setOnFocusChangeListener(l);
         btnLock.setOnFocusChangeListener(l);
+        if (btnRotate != null) btnRotate.setOnFocusChangeListener(l);
         btnCloudMode.setOnFocusChangeListener(l);
         if (btnBrightness != null) btnBrightness.setOnFocusChangeListener(l);
         if (btnSkip != null) btnSkip.setOnFocusChangeListener(l);
@@ -1742,8 +1896,65 @@ public class PlayerActivity extends AppCompatActivity {
     }
 
     private void restoreOrientation() {
-        // 退出/暂停播放时恢复跟随系统旋转锁定策略，不再强制横屏(TV)/竖屏(手机)
-        setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
+        // 退出/暂停播放时恢复跟随系统旋转锁定策略；TV 恒横屏
+        if (isTvDevice()) {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        } else {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
+        }
+    }
+
+    /** 手动切换横/竖屏（VidHub 式按钮） */
+    private void toggleManualOrientation() {
+        if (isTvDevice()) return;
+        boolean goingLandscape;
+        switch (getRequestedOrientation()) {
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE:
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE:
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE:
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER_LANDSCAPE:
+                goingLandscape = false;
+                break;
+            default:
+                goingLandscape = true;
+        }
+        if (goingLandscape) {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+            userPortrait = false;
+        } else {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT);
+            userPortrait = true;
+        }
+        updateRotateBtn();
+    }
+
+    private void updateRotateBtn() {
+        if (btnRotate == null) return;
+        boolean curPortrait;
+        switch (getRequestedOrientation()) {
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT:
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT:
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT:
+            case android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT:
+                curPortrait = true;
+                break;
+            default:
+                curPortrait = false;
+        }
+        // 文案 = 点按后将切往的方向
+        btnRotate.setText(curPortrait ? "横屏" : "竖屏");
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // 回到前台恢复播放方向（后台时 onPause 已交还系统），尊重用户手动选择
+        if (!isTvDevice()) {
+            setRequestedOrientation(userPortrait
+                    ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                    : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        }
+        hideSystemUi();
     }
 
     @Override protected void onPause() {
